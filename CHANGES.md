@@ -1,6 +1,13 @@
 In development
 ==============
 
+- Add `dump_bundle` and `load_bundle`: a versioned, length-framed container
+  for pickle protocol 5 payloads and their out-of-band buffers, with a
+  committed integrity manifest (per-buffer order, length, read-only flag and
+  SHA-256 digest, plus payload digest), bounded chunked I/O, resource limits
+  enforced before reading, full validation before any unpickling, and
+  explicit ownership of memory-mapped temporary storage.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 
