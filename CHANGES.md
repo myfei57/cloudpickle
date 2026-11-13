@@ -1,6 +1,11 @@
 In development
 ==============
 
+- Add `ReconstructionScope` with scoped `load`/`loads` methods to reconstruct
+  dynamic classes, enums and TypeVars in an identity namespace local to the
+  scope, without touching the process-global dynamic class trackers. Plain
+  `cloudpickle.loads` keeps its existing process-global identity behavior.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

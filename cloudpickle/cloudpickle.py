@@ -54,6 +54,7 @@ import _collections_abc
 from collections import ChainMap, OrderedDict
 import abc
 import builtins
+import contextvars
 import copyreg
 import dataclasses
 import dis
@@ -94,6 +95,23 @@ _DYNAMIC_CLASS_TRACKER_BY_CLASS = weakref.WeakKeyDictionary()
 _DYNAMIC_CLASS_TRACKER_BY_ID = weakref.WeakValueDictionary()
 _DYNAMIC_CLASS_TRACKER_LOCK = threading.Lock()
 
+# Currently active ReconstructionScope, if any. A ContextVar is used instead
+# of a plain global (or threading.local) so that scope activation is local to
+# both the calling thread and each asyncio task: threads do not share context
+# variables, and every asyncio task runs in a copy of the context captured at
+# its creation time, preventing scopes from leaking across concurrent loads.
+_ACTIVE_RECONSTRUCTION_SCOPE = contextvars.ContextVar(
+    "cloudpickle_active_reconstruction_scope", default=None
+)
+
+# Per-context stack of ContextVar tokens used when a scope is activated
+# explicitly as a context manager. Storing tokens in a ContextVar rather than
+# on the scope instance makes nested activations safe even if the same scope
+# is entered concurrently from different threads or asyncio tasks.
+_RECONSTRUCTION_SCOPE_TOKENS = contextvars.ContextVar(
+    "cloudpickle_reconstruction_scope_tokens", default=()
+)
+
 PYPY = platform.python_implementation() == "PyPy"
 
 builtin_code_type = None
@@ -116,12 +134,190 @@ def _get_or_create_tracker_id(class_def):
 
 def _lookup_class_or_track(class_tracker_id, class_def):
     if class_tracker_id is not None:
+        scope = _ACTIVE_RECONSTRUCTION_SCOPE.get()
+        if scope is not None:
+            # Reconstructing inside an explicit ReconstructionScope: do not
+            # read from nor write to the process-global trackers, so that
+            # isolated loads cannot break concurrent plain loads or the
+            # identity of objects that were reconstructed earlier.
+            return scope._lookup_or_track(class_tracker_id, class_def)
         with _DYNAMIC_CLASS_TRACKER_LOCK:
             class_def = _DYNAMIC_CLASS_TRACKER_BY_ID.setdefault(
                 class_tracker_id, class_def
             )
             _DYNAMIC_CLASS_TRACKER_BY_CLASS[class_def] = class_tracker_id
     return class_def
+
+
+class ReconstructionScope:
+    """Identity namespace for reconstructing dynamic classes, enums and TypeVars.
+
+    Objects pickled by value (interactively or locally defined classes, Enum
+    subclasses and TypeVars) carry a cloudpickle "tracker id" that is used at
+    load time to reconstruct a singleton definition shared by every instance
+    stemming from the same pickled definition. By default, this identity
+    registry is process-global (see the ``_DYNAMIC_CLASS_TRACKER_*`` maps).
+    A ``ReconstructionScope`` provides an alternative registry that is local
+    to the scope:
+
+    - independent payloads loaded through the same scope reuse the same
+      reconstructed dynamic objects through their tracker ids, including
+      across separate ``load``/``loads`` calls;
+    - two distinct scopes always reconstruct distinct class objects for the
+      same payload, even though the payloads carry the same tracker ids;
+    - scoped loads never read from nor write to the process-global trackers,
+      so they cannot affect concurrent plain ``loads`` calls or the identity
+      of objects reconstructed before the scope was opened;
+    - objects pickled by reference (attributes of importable modules) bypass
+      the tracker entirely through the standard pickle global lookup
+      mechanism: they are not copied and remain shared process-wide. A scope
+      does not claim to isolate arbitrary module import side effects.
+
+    Compatibility policy for the tracker ids found in pickle streams:
+
+    - a tracker id unknown to the scope is *adopted*: the first reconstructed
+      object for that id becomes the canonical object in the scope and is
+      reused for every later occurrence, including in other payloads loaded
+      through the same scope;
+    - payloads generated without tracker ids (``class_tracker_id is None`` as
+      produced by very old cloudpickle versions) are loaded without any
+      tracking, exactly like plain ``pickle.loads``;
+    - payloads produced by current or older cloudpickle versions can be
+      loaded unchanged, no re-pickling is required.
+
+    Ownership protocol: the scope only keeps weak references to the
+    reconstructed dynamic objects. The objects returned to the caller (and the
+    instances referencing their class) hold the strong references; once they
+    are garbage collected, the corresponding scope entries disappear as well,
+    so a long-lived scope cannot accumulate unbounded strong references.
+    After ``close``, new loads and activations are rejected with a
+    ``RuntimeError`` while objects returned earlier keep working normally.
+
+    The active scope is held in a ``contextvars.ContextVar``: it is local to
+    the calling thread and to each asyncio task, and explicit nested
+    activations (``with`` blocks or nested ``load``/``loads`` calls) restore
+    the previously active scope on exit. The scope id is only used in the
+    repr of the scope and is never embedded in reconstructed class names nor
+    inserted into ``sys.modules``.
+    """
+
+    def __init__(self):
+        self._scope_id = uuid.uuid4().hex
+        self._lock = threading.Lock()
+        self._closed = False
+        # Weak mappings mirror the process-global trackers and implement the
+        # no-strong-reference ownership protocol documented above.
+        self._tracker_by_class = weakref.WeakKeyDictionary()
+        self._tracker_by_id = weakref.WeakValueDictionary()
+
+    @property
+    def closed(self):
+        """Whether this scope has been closed and rejects new loads."""
+        return self._closed
+
+    def __repr__(self):
+        state = "closed" if self._closed else "open"
+        return f"<ReconstructionScope {self._scope_id} ({state})>"
+
+    def _check_open(self):
+        if self._closed:
+            raise RuntimeError(
+                f"Cannot use closed ReconstructionScope {self._scope_id!r} "
+                "for new pickle loads"
+            )
+
+    def _lookup_or_track(self, class_tracker_id, class_def):
+        """Resolve a tracker id against this scope's local identity registry."""
+        with self._lock:
+            self._check_open()
+            existing = self._tracker_by_id.get(class_tracker_id)
+            if existing is None:
+                self._tracker_by_id[class_tracker_id] = class_def
+                self._tracker_by_class[class_def] = class_tracker_id
+                return class_def
+            return existing
+
+    def __enter__(self):
+        self._check_open()
+        token = _ACTIVE_RECONSTRUCTION_SCOPE.set(self)
+        _RECONSTRUCTION_SCOPE_TOKENS.set(_RECONSTRUCTION_SCOPE_TOKENS.get() + (token,))
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        tokens = _RECONSTRUCTION_SCOPE_TOKENS.get()
+        token = tokens[-1]
+        _RECONSTRUCTION_SCOPE_TOKENS.set(tokens[:-1])
+        _ACTIVE_RECONSTRUCTION_SCOPE.reset(token)
+        return False
+
+    def loads(
+        self,
+        data,
+        /,
+        *,
+        fix_imports=True,
+        encoding="ASCII",
+        errors="strict",
+        buffers=None,
+    ):
+        """Reconstruct a pickled object inside this reconstruction scope.
+
+        Scoped counterpart of ``cloudpickle.loads`` (which itself behaves like
+        ``pickle.loads``). The scope is activated only for the duration of the
+        call and the previously active scope (if any) is restored afterwards,
+        even when the call raises.
+        """
+        self._check_open()
+        token = _ACTIVE_RECONSTRUCTION_SCOPE.set(self)
+        try:
+            return pickle.loads(
+                data,
+                fix_imports=fix_imports,
+                encoding=encoding,
+                errors=errors,
+                buffers=buffers,
+            )
+        finally:
+            _ACTIVE_RECONSTRUCTION_SCOPE.reset(token)
+
+    def load(
+        self,
+        file,
+        *,
+        fix_imports=True,
+        encoding="ASCII",
+        errors="strict",
+        buffers=None,
+    ):
+        """Reconstruct a pickled object streamed from ``file`` in this scope.
+
+        Scoped counterpart of ``cloudpickle.load``; see ``loads`` for the
+        scope activation semantics.
+        """
+        self._check_open()
+        token = _ACTIVE_RECONSTRUCTION_SCOPE.set(self)
+        try:
+            return pickle.load(
+                file,
+                fix_imports=fix_imports,
+                encoding=encoding,
+                errors=errors,
+                buffers=buffers,
+            )
+        finally:
+            _ACTIVE_RECONSTRUCTION_SCOPE.reset(token)
+
+    def close(self):
+        """Close this scope.
+
+        Subsequent ``load``/``loads`` calls and ``with`` activations are
+        rejected with a ``RuntimeError``. Objects reconstructed before closing
+        keep working: closing only flips the scope state, it does not
+        invalidate any returned class or instance (the scope never owned
+        strong references to them).
+        """
+        with self._lock:
+            self._closed = True
 
 
 def register_pickle_by_value(module):
