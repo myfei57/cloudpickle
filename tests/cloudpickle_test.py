@@ -335,6 +335,354 @@ class CloudPickleTest(unittest.TestCase):
         g = pickle_depickle(f(), protocol=self.protocol)
         self.assertEqual(g(), 2)
 
+    def test_shared_closure_cell_identity(self):
+        # Several functions referencing the same closure cell must keep
+        # sharing the very same cell object after a roundtrip, so that
+        # nonlocal mutations remain visible to all of them.
+        def make_pair():
+            value = 0
+
+            def set_value(x):
+                nonlocal value
+                value = x
+
+            def get_value():
+                return value
+
+            return set_value, get_value
+
+        set_value, get_value = make_pair()
+        self.assertIs(set_value.__closure__[0], get_value.__closure__[0])
+
+        set_value2, get_value2 = pickle_depickle(
+            (set_value, get_value), protocol=self.protocol
+        )
+        shared_cell = set_value2.__closure__[0]
+        self.assertIs(shared_cell, get_value2.__closure__[0])
+
+        set_value2(7)
+        self.assertEqual(get_value2(), 7)
+        set_value2(9)
+        self.assertEqual(get_value2(), 9)
+        self.assertIs(shared_cell, get_value2.__closure__[0])
+
+    def test_shared_closure_cell_nonlocal_deletion(self):
+        # Deleting a nonlocal variable through one function must be visible
+        # from the other functions sharing the same cell, and the cell must
+        # remain reusable afterwards.
+        def make_triple():
+            value = 1
+
+            def delete_value():
+                nonlocal value
+                del value
+
+            def get_value():
+                return value
+
+            def set_value(x):
+                nonlocal value
+                value = x
+
+            return delete_value, get_value, set_value
+
+        delete_value, get_value, set_value = pickle_depickle(
+            make_triple(), protocol=self.protocol
+        )
+        cell = get_value.__closure__[0]
+        self.assertIs(cell, delete_value.__closure__[0])
+        self.assertIs(cell, set_value.__closure__[0])
+
+        delete_value()
+        with self.assertRaises(NameError):
+            get_value()
+        with self.assertRaises(ValueError):
+            cell.cell_contents
+
+        set_value(42)
+        self.assertEqual(get_value(), 42)
+        self.assertEqual(cell.cell_contents, 42)
+
+    def test_distinct_closure_cells_with_equal_contents(self):
+        # Cell identity must be tracked strictly: two distinct cells holding
+        # equal values must not be merged on the sole basis of content
+        # equality.
+        def make_functions():
+            a = 100
+            b = 100
+
+            def write_a(x):
+                nonlocal a
+                a = x
+
+            def read_a():
+                return a
+
+            def write_b(x):
+                nonlocal b
+                b = x
+
+            def read_b():
+                return b
+
+            return write_a, read_a, write_b, read_b
+
+        write_a, read_a, write_b, read_b = pickle_depickle(
+            make_functions(), protocol=self.protocol
+        )
+        cell_a = read_a.__closure__[0]
+        cell_b = read_b.__closure__[0]
+        self.assertIsNot(cell_a, cell_b)
+        self.assertIs(cell_a, write_a.__closure__[0])
+        self.assertIs(cell_b, write_b.__closure__[0])
+
+        write_a(1)
+        self.assertEqual(read_a(), 1)
+        self.assertEqual(read_b(), 100)
+        write_b(2)
+        self.assertEqual(read_a(), 1)
+        self.assertEqual(read_b(), 2)
+
+    def test_distinct_empty_closure_cells_are_not_merged(self):
+        def make_functions():
+            def first():
+                if False:  # pragma: no cover
+                    x = None
+
+                def read_x():
+                    return x
+
+                def write_x(v):
+                    nonlocal x
+                    x = v
+
+                return read_x, write_x
+
+            def second():
+                if False:  # pragma: no cover
+                    y = None
+
+                def read_y():
+                    return y
+
+                def write_y(v):
+                    nonlocal y
+                    y = v
+
+                return read_y, write_y
+
+            return first() + second()
+
+        read_x, write_x, read_y, write_y = pickle_depickle(
+            make_functions(), protocol=self.protocol
+        )
+        self.assertIsNot(read_x.__closure__[0], read_y.__closure__[0])
+        with self.assertRaises(NameError):
+            read_x()
+        write_x(11)
+        self.assertEqual(read_x(), 11)
+        with self.assertRaises(NameError):
+            read_y()
+
+    def test_shared_empty_closure_cell(self):
+        # An empty cell shared by several functions must stay shared and
+        # empty after unpickling, until one of the functions fills it.
+        def make_pair():
+            def outer():
+                if False:  # pragma: no cover
+                    z = None
+
+                def reader():
+                    return z
+
+                def writer(v):
+                    nonlocal z
+                    z = v
+
+                return reader, writer
+
+            return outer()
+
+        reader, writer = pickle_depickle(make_pair(), protocol=self.protocol)
+        cell = reader.__closure__[0]
+        self.assertIs(cell, writer.__closure__[0])
+        with self.assertRaises(ValueError):
+            cell.cell_contents
+        with self.assertRaises(NameError):
+            reader()
+
+        writer("filled")
+        self.assertEqual(reader(), "filled")
+        self.assertEqual(cell.cell_contents, "filled")
+
+    def test_shared_closure_cell_with_recursive_functions(self):
+        # Recursive functions reference themselves through a closure cell:
+        # the reconstructed self-referential cell must point back to the
+        # reconstructed function itself.
+        def make_factorial():
+            def factorial(n):
+                return 1 if n <= 1 else n * factorial(n - 1)
+
+            return factorial
+
+        factorial = pickle_depickle(make_factorial(), protocol=self.protocol)
+        self.assertEqual(factorial(5), 120)
+        self.assertIs(factorial.__closure__[0].cell_contents, factorial)
+
+        # Mutually recursive functions keep pointing at each other.
+        def make_mutual():
+            def is_even(n):
+                return n == 0 or is_odd(n - 1)
+
+            def is_odd(n):
+                return n != 0 and is_even(n - 1)
+
+            return is_even, is_odd
+
+        is_even, is_odd = pickle_depickle(make_mutual(), protocol=self.protocol)
+        self.assertTrue(is_even(10))
+        self.assertTrue(is_odd(7))
+        self.assertFalse(is_even(3))
+        self.assertIn(
+            is_odd,
+            [cell.cell_contents for cell in is_even.__closure__],
+        )
+        self.assertIn(
+            is_even,
+            [cell.cell_contents for cell in is_odd.__closure__],
+        )
+
+    def test_closure_cell_explicitly_pickled_keeps_identity(self):
+        # The same cell can be both part of a function closure and
+        # serialized as a standalone object, whatever its position relative
+        # to the functions in the pickled object graph.
+        def make_bundle():
+            value = 5
+
+            def set_value(x):
+                nonlocal value
+                value = x
+
+            def get_value():
+                return value
+
+            cell = get_value.__closure__[0]
+            return set_value, get_value, cell
+
+        for bundle in (make_bundle(), tuple(reversed(make_bundle()))):
+            # The second bundle puts the standalone cell first in the graph,
+            # so that identity sharing does not depend on pickling order.
+            restored = pickle_depickle(bundle, protocol=self.protocol)
+            funcs = [obj for obj in restored if isinstance(obj, types.FunctionType)]
+            set_value2 = next(f for f in funcs if f.__name__ == "set_value")
+            get_value2 = next(f for f in funcs if f.__name__ == "get_value")
+            cell2 = next(obj for obj in restored if isinstance(obj, types.CellType))
+            self.assertIs(cell2, set_value2.__closure__[0])
+            self.assertIs(cell2, get_value2.__closure__[0])
+            set_value2(123)
+            self.assertEqual(get_value2(), 123)
+            self.assertEqual(cell2.cell_contents, 123)
+
+    def test_shared_closure_cells_with_different_freevars_orders(self):
+        # Functions may reference shared cells in different orders and use
+        # different subsets of free variables: identity must be preserved
+        # per cell, not per closure slot index.
+        def make_functions():
+            x, y, z = 1, 2, 3
+
+            def read_all():  # freevars: x, y, z
+                return x, y, z
+
+            def read_zx():  # freevars: z, x (different order, subset)
+                return z, x
+
+            def set_x(v):
+                nonlocal x
+                x = v
+
+            def set_z(v):
+                nonlocal z
+                z = v
+
+            return read_all, read_zx, set_x, set_z
+
+        read_all, read_zx, set_x, set_z = pickle_depickle(
+            make_functions(), protocol=self.protocol
+        )
+        all_cells = dict(zip(read_all.__code__.co_freevars, read_all.__closure__))
+        zx_cells = dict(zip(read_zx.__code__.co_freevars, read_zx.__closure__))
+        self.assertIs(all_cells["x"], zx_cells["x"])
+        self.assertIs(all_cells["z"], zx_cells["z"])
+        self.assertIs(all_cells["x"], set_x.__closure__[0])
+        self.assertIs(all_cells["z"], set_z.__closure__[0])
+        self.assertIsNot(all_cells["x"], all_cells["y"])
+        self.assertIsNot(all_cells["y"], all_cells["z"])
+
+        self.assertEqual(read_all(), (1, 2, 3))
+        self.assertEqual(read_zx(), (3, 1))
+        set_x(10)
+        set_z(30)
+        self.assertEqual(read_all(), (10, 2, 30))
+        self.assertEqual(read_zx(), (30, 10))
+
+    def test_closure_cell_sharing_memo_boundaries(self):
+        # Two functions dumped with the same Pickler instance (and therefore
+        # the same memo) keep sharing their cell when read back with a single
+        # Unpickler instance. Separate cloudpickle.dumps calls use distinct
+        # picklers and do not share cells across payloads.
+        def make_pair():
+            value = 0
+
+            def set_value(x):
+                nonlocal value
+                value = x
+
+            def get_value():
+                return value
+
+            return set_value, get_value
+
+        set_value, get_value = make_pair()
+        buffer = io.BytesIO()
+        pickler = cloudpickle.Pickler(buffer, protocol=self.protocol)
+        pickler.dump(set_value)
+        pickler.dump(get_value)
+        buffer.seek(0)
+
+        unpickler = pickle.Unpickler(buffer)
+        set_value2 = unpickler.load()
+        get_value2 = unpickler.load()
+        self.assertIs(set_value2.__closure__[0], get_value2.__closure__[0])
+        set_value2(55)
+        self.assertEqual(get_value2(), 55)
+
+        # Independent dumps() calls are isolated from each other.
+        set_value3 = pickle_depickle(set_value, protocol=self.protocol)
+        get_value3 = pickle_depickle(get_value, protocol=self.protocol)
+        self.assertIsNot(set_value3.__closure__[0], get_value3.__closure__[0])
+
+    def test_shared_closure_cell_in_class_methods(self):
+        class Holder:
+            def make_accessors(self):
+                counter = 0
+
+                def increment():
+                    nonlocal counter
+                    counter += 1
+                    return counter
+
+                def get_counter():
+                    return counter
+
+                return increment, get_counter
+
+        holder = pickle_depickle(Holder(), protocol=self.protocol)
+        increment, get_counter = holder.make_accessors()
+        self.assertIs(increment.__closure__[0], get_counter.__closure__[0])
+        self.assertEqual(increment(), 1)
+        self.assertEqual(increment(), 2)
+        self.assertEqual(get_counter(), 2)
+
     def test_class_no_firstlineno_deletion_(self):
         # `__firstlineno__` is a new attribute of classes introduced in Python 3.13.
         # This attribute used to be automatically deleted when unpickling a class as a
