@@ -1,6 +1,13 @@
 In development
 ==============
 
+- Add the `GlobalBindingPolicy` / `StaticGlobalBindingPolicy` API and a
+  matching `global_binding_resolver` loading-side hook (exposed through
+  `cloudpickle.Unpickler`, `cloudpickle.load` and `cloudpickle.loads`).
+  Selected globals of functions pickled by value can now be externalized as
+  restricted pure-data resource tokens instead of being serialized
+  themselves.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

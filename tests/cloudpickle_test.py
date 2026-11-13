@@ -1,5 +1,6 @@
 import _collections_abc
 import abc
+import builtins
 import collections
 import base64
 import dataclasses
@@ -3178,6 +3179,624 @@ def test_module_level_pickler():
     # cloudpickle.Pickler
     assert hasattr(cloudpickle, "Pickler")
     assert cloudpickle.Pickler is cloudpickle.CloudPickler
+
+
+# ---------------------------------------------------------------------------
+# Externalized global bindings (GlobalBindingPolicy + loading-side resolver)
+# ---------------------------------------------------------------------------
+
+
+class _UnpicklableConnection:
+    """Stand-in for a live external resource that cannot be serialized."""
+
+    marker = "cloudpickle-unpicklable-connection-marker"
+
+    def __reduce__(self):
+        raise TypeError("external connections must not be serialized by value")
+
+
+def _make_test_namespace(name, **values):
+    """Build an isolated globals namespace with a controlled __name__."""
+    namespace = {"__name__": name, "__builtins__": builtins.__dict__}
+    namespace.update(values)
+    return namespace
+
+
+def _define_in_namespace(namespace, source):
+    exec(source, namespace)
+
+
+class _ExternalizeAllPolicy(cloudpickle.GlobalBindingPolicy):
+    def token_for_binding(self, func, name):
+        return f"token:{name}"
+
+
+class _IncrementingTokenPolicy(cloudpickle.GlobalBindingPolicy):
+    """Returns a different token each time the same binding is encountered."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def token_for_binding(self, func, name):
+        if name != "conn":
+            return None
+        self.calls += 1
+        return f"token-{self.calls}"
+
+
+class _ExternalizeThenByValuePolicy(cloudpickle.GlobalBindingPolicy):
+    """Externalizes on first encounter, then switches to by-value."""
+
+    def __init__(self):
+        self.seen = set()
+
+    def token_for_binding(self, func, name):
+        if name != "conn":
+            return None
+        key = (id(func.__globals__), name)
+        if key in self.seen:
+            return None
+        self.seen.add(key)
+        return "token-conn"
+
+
+class _ByValueThenExternalizePolicy(cloudpickle.GlobalBindingPolicy):
+    """Keeps by-value first, then switches to externalization."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def token_for_binding(self, func, name):
+        if name != "conn":
+            return None
+        self.calls += 1
+        return None if self.calls == 1 else "token-conn"
+
+
+class _BoomPolicy(cloudpickle.GlobalBindingPolicy):
+    def token_for_binding(self, func, name):
+        raise RuntimeError("policy boom")
+
+
+class _BadTokenPolicy(cloudpickle.GlobalBindingPolicy):
+    def token_for_binding(self, func, name):
+        if name == "conn":
+            return {"allowed": 1, "bad": object()}
+        return None
+
+
+_POLICY_PROTOCOLS = [2, cloudpickle.DEFAULT_PROTOCOL]
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_external_global_binding_shared_by_two_functions(protocol):
+    connection = _UnpicklableConnection()
+    namespace = _make_test_namespace("gbp_shared_ns", conn=connection)
+    _define_in_namespace(
+        namespace,
+        "def get_conn():\n" "    return conn\n" "def use_conn():\n" "    return conn\n",
+    )
+    get_conn = namespace["get_conn"]
+    use_conn = namespace["use_conn"]
+    assert get_conn.__globals__ is use_conn.__globals__ is namespace
+
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "conn", "resource-token-conn")]
+    )
+    payload = cloudpickle.dumps(
+        [get_conn, use_conn], protocol=protocol, global_binding_policy=policy
+    )
+
+    # The token travels in the payload but the unpicklable value never does.
+    assert b"resource-token-conn" in payload
+    assert _UnpicklableConnection.marker.encode() not in payload
+    # The user namespace is never mutated: no key is removed/restored.
+    assert namespace["conn"] is connection
+
+    resolved = object()
+    calls = []
+
+    def resolver(token, binding):
+        calls.append((token, binding))
+        assert token == "resource-token-conn"
+        assert isinstance(binding, cloudpickle.GlobalBinding)
+        assert binding.name == "conn"
+        assert binding.namespace == "gbp_shared_ns"
+        return resolved
+
+    loaded_get, loaded_use = cloudpickle.loads(
+        payload, global_binding_resolver=resolver
+    )
+    # Protocol-fixed sharing rule: one resolver call per (namespace, name),
+    # the resolved object is shared by every function of the namespace.
+    assert len(calls) == 1
+    assert loaded_get() is resolved
+    assert loaded_use() is resolved
+    assert loaded_get.__globals__ is loaded_use.__globals__
+    assert loaded_get.__globals__ is not namespace
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_same_value_in_plain_container_still_pickled_by_value(protocol):
+    connection = _UnpicklableConnection()
+    namespace = _make_test_namespace("gbp_container_ns", conn=connection)
+    _define_in_namespace(namespace, "def get_conn():\n    return conn\n")
+    get_conn = namespace["get_conn"]
+
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "conn", "resource-token-conn")]
+    )
+    # The function can be serialized because the binding is externalized.
+    payload = cloudpickle.dumps(
+        get_conn, protocol=protocol, global_binding_policy=policy
+    )
+    assert b"resource-token-conn" in payload
+
+    # The very same object in a plain dict field is not covered by the
+    # policy (selection is based on namespace identity + name, not value id)
+    # and still goes through the default by-value path, which fails.
+    with pytest.raises(Exception):
+        cloudpickle.dumps({"conn": connection}, protocol=protocol)
+
+    # Without the policy, the function itself cannot be pickled either.
+    with pytest.raises(Exception):
+        cloudpickle.dumps(get_conn, protocol=protocol)
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_same_name_in_different_namespaces(protocol):
+    connection_a, connection_b = object(), object()
+    ns_a = _make_test_namespace("gbp_ns_a", conn=connection_a)
+    ns_b = _make_test_namespace("gbp_ns_b", conn=connection_b)
+    _define_in_namespace(ns_a, "def get_conn():\n    return conn\n")
+    _define_in_namespace(ns_b, "def get_conn():\n    return conn\n")
+    f_a, f_b = ns_a["get_conn"], ns_b["get_conn"]
+    assert f_a.__globals__ is not f_b.__globals__
+
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(ns_a, "conn", "token-a"), (ns_b, "conn", "token-b")]
+    )
+    payload = cloudpickle.dumps(
+        [f_a, f_b], protocol=protocol, global_binding_policy=policy
+    )
+    seen = {}
+
+    def resolver(token, binding):
+        seen.setdefault(token, []).append(binding)
+        return {"token-a": connection_a, "token-b": connection_b}[token]
+
+    loaded_a, loaded_b = cloudpickle.loads(payload, global_binding_resolver=resolver)
+    assert loaded_a() is connection_a
+    assert loaded_b() is connection_b
+    assert loaded_a.__globals__ is not loaded_b.__globals__
+    assert [binding.namespace for binding in seen["token-a"]] == ["gbp_ns_a"]
+    assert [binding.namespace for binding in seen["token-b"]] == ["gbp_ns_b"]
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_equal_tokens_in_different_namespaces_are_resolved_independently(protocol):
+    ns_a = _make_test_namespace("gbp_eq_a", conn=object())
+    ns_b = _make_test_namespace("gbp_eq_b", conn=object())
+    _define_in_namespace(ns_a, "def f():\n    return conn\n")
+    _define_in_namespace(ns_b, "def f():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(ns_a, "conn", "same-token"), (ns_b, "conn", "same-token")]
+    )
+    payload = cloudpickle.dumps(
+        [ns_a["f"], ns_b["f"]],
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    calls = []
+
+    def resolver(token, binding):
+        calls.append(binding)
+        return object()  # a distinct object on every resolver call
+
+    loaded_a, loaded_b = cloudpickle.loads(payload, global_binding_resolver=resolver)
+    # Protocol rule: bindings in distinct namespaces are resolved separately,
+    # even when their tokens compare equal; no implicit cross-namespace dedup.
+    assert len(calls) == 2
+    assert loaded_a() is not loaded_b()
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_recursive_and_mutually_referential_functions_share_namespace(protocol):
+    helper = _UnpicklableConnection()
+    namespace = _make_test_namespace("gbp_recursion_ns", helper=helper, base=10)
+    _define_in_namespace(
+        namespace,
+        "def factorial(n):\n"
+        "    if n <= 1:\n"
+        "        return base\n"
+        "    return n * factorial(n - 1)\n"
+        "def is_even(n):\n"
+        "    if n == 0:\n"
+        "        return helper is helper\n"
+        "    return is_odd(n - 1)\n"
+        "def is_odd(n):\n"
+        "    if n == 0:\n"
+        "        return False\n"
+        "    return is_even(n - 1)\n",
+    )
+    factorial = namespace["factorial"]
+    is_even = namespace["is_even"]
+    is_odd = namespace["is_odd"]
+
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "helper", "helper-token")]
+    )
+    payload = cloudpickle.dumps(
+        [factorial, is_even, is_odd],
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    external_helper = object()
+    loaded_fact, loaded_even, loaded_odd = cloudpickle.loads(
+        payload, global_binding_resolver=lambda token, binding: external_helper
+    )
+    assert loaded_fact(5) == 1200  # 5! * base
+    assert loaded_even(10) is True
+    assert loaded_odd(7) is True
+    # All functions still share one reconstructed namespace...
+    assert loaded_fact.__globals__ is loaded_even.__globals__ is loaded_odd.__globals__
+    # ...containing the single externally resolved object while the
+    # unselected global keeps following the default by-value logic.
+    assert loaded_fact.__globals__["helper"] is external_helper
+    assert loaded_fact.__globals__["base"] == 10
+    assert namespace["helper"] is helper
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_resolver_failure_reports_binding_path(protocol):
+    namespace = _make_test_namespace("gbp_failure_ns", conn=object())
+    _define_in_namespace(namespace, "def failing():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "conn", "missing-token")]
+    )
+    payload = cloudpickle.dumps(
+        namespace["failing"],
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+
+    def resolver(token, binding):
+        raise KeyError(token)
+
+    expected_path = (
+        "global binding 'conn' of function 'failing' in namespace " "'gbp_failure_ns'"
+    )
+    with pytest.raises(pickle.UnpicklingError, match=re.escape(expected_path)):
+        cloudpickle.loads(payload, global_binding_resolver=resolver)
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_loading_without_resolver_raises_guidance_error(protocol):
+    namespace = _make_test_namespace("gbp_no_resolver_ns", conn=object())
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy([(namespace, "conn", "token")])
+    payload = cloudpickle.dumps(
+        namespace["f"], protocol=protocol, global_binding_policy=policy
+    )
+    # A plain pickle unpickler cannot resolve tokens and must get an explicit
+    # guidance error instead of an implicit import or an empty binding.
+    with pytest.raises(pickle.UnpicklingError, match="global_binding_resolver"):
+        pickle.loads(payload)
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_conflicting_tokens_raise_before_any_byte_is_serialized(protocol):
+    namespace = _make_test_namespace("gbp_conflict_ns", conn=object())
+    _define_in_namespace(
+        namespace,
+        "def f1():\n    return conn\ndef f2():\n    return conn\n",
+    )
+    f1, f2 = namespace["f1"], namespace["f2"]
+    policy = _IncrementingTokenPolicy()
+
+    destination = io.BytesIO()
+    pickler = cloudpickle.Pickler(
+        destination,
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    with pytest.raises(
+        pickle.PicklingError, match="inconsistent global binding policy"
+    ):
+        pickler.dump([f1, f2])
+    # The conflict is detected before serialization: destination stays empty.
+    assert destination.getvalue() == b""
+    # The original namespace is untouched.
+    assert namespace["conn"] is not None
+    assert namespace["f1"] is f1 and namespace["f2"] is f2
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+@pytest.mark.parametrize(
+    "policy_factory",
+    [_ExternalizeThenByValuePolicy, _ByValueThenExternalizePolicy],
+)
+def test_inconsistent_externalization_decisions_raise(protocol, policy_factory):
+    namespace = _make_test_namespace("gbp_flip_ns", conn=object())
+    _define_in_namespace(
+        namespace,
+        "def f1():\n    return conn\ndef f2():\n    return conn\n",
+    )
+    with pytest.raises(
+        pickle.PicklingError, match="inconsistent global binding policy"
+    ):
+        cloudpickle.dumps(
+            [namespace["f1"], namespace["f2"]],
+            protocol=protocol,
+            global_binding_policy=policy_factory(),
+        )
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_by_reference_functions_ignore_global_binding_policy(protocol):
+    mod = pytest.importorskip("_cloudpickle_testpkg.mod")
+    func = mod.module_function_with_global
+    assert _should_pickle_by_reference(func)
+
+    policy = _ExternalizeAllPolicy()
+    payload = cloudpickle.dumps(func, protocol=protocol, global_binding_policy=policy)
+    # No externalized binding machinery is embedded for by-reference funcs:
+    # their globals are not serialized in the first place.
+    assert b"_cloudpickle_external_globals" not in payload
+    # A plain pickle unpickler needs no resolver at all.
+    reloaded = pickle.loads(payload)
+    assert reloaded() == "some global variable"
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_loading_does_not_pollute_imported_module_dict(protocol):
+    import json
+
+    binding_name = "cloudpickle_external_binding_probe"
+    assert not hasattr(json, binding_name)
+    try:
+        # The dynamic namespace deliberately borrows the real module's label.
+        namespace = _make_test_namespace("json", **{binding_name: object()})
+        _define_in_namespace(namespace, f"def f():\n    return {binding_name}\n")
+        policy = cloudpickle.StaticGlobalBindingPolicy(
+            [(namespace, binding_name, "probe-token")]
+        )
+        payload = cloudpickle.dumps(
+            namespace["f"],
+            protocol=protocol,
+            global_binding_policy=policy,
+        )
+        external = object()
+        loaded = cloudpickle.loads(
+            payload, global_binding_resolver=lambda token, binding: external
+        )
+        assert loaded() is external
+        assert loaded.__globals__ is not json.__dict__
+        assert not hasattr(json, binding_name)
+    finally:
+        json.__dict__.pop(binding_name, None)
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_reentrant_resolver_restores_context_correctly(protocol):
+    inner_ns = _make_test_namespace("gbp_inner_ns", value=123)
+    _define_in_namespace(inner_ns, "def inner():\n    return value\n")
+    inner_payload = cloudpickle.dumps(inner_ns["inner"], protocol=protocol)
+
+    outer_ns = _make_test_namespace("gbp_outer_ns", conn=object())
+    _define_in_namespace(outer_ns, "def outer():\n    return conn\n")
+    outer_policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(outer_ns, "conn", "outer-token")]
+    )
+    outer_payload = cloudpickle.dumps(
+        outer_ns["outer"],
+        protocol=protocol,
+        global_binding_policy=outer_policy,
+    )
+
+    log = []
+
+    def fail_resolver(token, binding):
+        pytest.fail("the inner payload has no externalized binding")
+
+    def resolver(token, binding):
+        log.append((token, binding.name))
+        assert token == "outer-token"
+        # Reentrant load: it gets its own unpickler instance and resolver
+        # context, the outer one remains intact when the call returns.
+        inner_func = cloudpickle.loads(
+            inner_payload, global_binding_resolver=fail_resolver
+        )
+        assert inner_func() == 123
+        return "resolved-outer"
+
+    loaded_outer = cloudpickle.loads(outer_payload, global_binding_resolver=resolver)
+    assert loaded_outer() == "resolved-outer"
+    assert log == [("outer-token", "conn")]
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_non_pure_tokens_are_rejected(protocol):
+    namespace = _make_test_namespace("gbp_bad_token_ns", conn=object())
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    with pytest.raises(pickle.PicklingError, match="pure data"):
+        cloudpickle.dumps(
+            namespace["f"],
+            protocol=protocol,
+            global_binding_policy=_BadTokenPolicy(),
+        )
+
+    # The static policy validates tokens eagerly at construction time.
+    with pytest.raises(pickle.PicklingError, match="pure data"):
+        cloudpickle.StaticGlobalBindingPolicy([(namespace, "conn", {"bad": object()})])
+    with pytest.raises(ValueError, match="cannot be None"):
+        cloudpickle.StaticGlobalBindingPolicy([(namespace, "conn", None)])
+    with pytest.raises(TypeError, match="triplet"):
+        cloudpickle.StaticGlobalBindingPolicy([(namespace, "conn")])
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_policy_exception_is_wrapped_with_binding_path(protocol):
+    namespace = _make_test_namespace("gbp_boom_ns", conn=object())
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    with pytest.raises(
+        pickle.PicklingError,
+        match=r"global binding policy raised an error for global binding 'conn'",
+    ):
+        cloudpickle.dumps(
+            namespace["f"],
+            protocol=protocol,
+            global_binding_policy=_BoomPolicy(),
+        )
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_base_policy_keeps_default_by_value_behavior(protocol):
+    namespace = _make_test_namespace("gbp_base_ns", conn="plain-value")
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    payload = cloudpickle.dumps(
+        namespace["f"],
+        protocol=protocol,
+        global_binding_policy=cloudpickle.GlobalBindingPolicy(),
+    )
+    # No resolver needed: everything went through the legacy by-value path.
+    loaded = pickle.loads(payload)
+    assert loaded() == "plain-value"
+    assert b"_cloudpickle_external_globals" not in payload
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_external_binding_payload_is_deterministic(protocol):
+    def build():
+        connection = _UnpicklableConnection()
+        namespace = _make_test_namespace("gbp_det_ns", conn=connection)
+        _define_in_namespace(
+            namespace,
+            "def f1():\n    return conn\ndef f2():\n    return conn\n",
+        )
+        policy = cloudpickle.StaticGlobalBindingPolicy(
+            [(namespace, "conn", "det-token")]
+        )
+        return cloudpickle.dumps(
+            [namespace["f1"], namespace["f2"]],
+            protocol=protocol,
+            global_binding_policy=policy,
+        )
+
+    check_deterministic_pickle(build(), build())
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_unpickler_class_direct_usage_and_input_validation(protocol):
+    namespace = _make_test_namespace("gbp_unpickler_ns", conn=object())
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "conn", "direct-token")]
+    )
+    payload = cloudpickle.dumps(
+        namespace["f"],
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    external = object()
+    unpickler = cloudpickle.Unpickler(
+        io.BytesIO(payload),
+        global_binding_resolver=lambda token, binding: external,
+    )
+    loaded = unpickler.load()
+    assert loaded() is external
+
+    with pytest.raises(TypeError, match="callable"):
+        cloudpickle.Unpickler(io.BytesIO(payload), global_binding_resolver=42)
+    with pytest.raises(TypeError, match="GlobalBindingPolicy"):
+        cloudpickle.Pickler(io.BytesIO(), global_binding_policy=object())
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_binding_descriptor_handles_anonymous_namespace(protocol):
+    namespace = {"__builtins__": builtins.__dict__, "conn": object()}
+    assert "__name__" not in namespace
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy([(namespace, "conn", "anon-token")])
+    payload = cloudpickle.dumps(
+        namespace["f"],
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    bindings = []
+
+    def resolver(token, binding):
+        bindings.append(binding)
+        assert binding.namespace is None
+        return "ok"
+
+    loaded = cloudpickle.loads(payload, global_binding_resolver=resolver)
+    assert loaded() == "ok"
+    assert bindings[0].name == "conn"
+    assert bindings[0].function == "f"
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_dump_streaming_with_policy_flushes_only_on_success(protocol):
+    namespace = _make_test_namespace("gbp_stream_ns", conn=object())
+    _define_in_namespace(namespace, "def f():\n    return conn\n")
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [(namespace, "conn", "stream-token")]
+    )
+    file = io.BytesIO()
+    cloudpickle.dump(
+        namespace["f"],
+        file,
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    assert file.getvalue()  # the buffered payload was flushed
+    loaded = cloudpickle.loads(
+        file.getvalue(), global_binding_resolver=lambda token, binding: "streamed"
+    )
+    assert loaded() == "streamed"
+
+
+@pytest.mark.parametrize("protocol", _POLICY_PROTOCOLS)
+def test_reused_pickler_with_policy_writes_distinct_streams(protocol):
+    # One Pickler instance can serve several dump() calls: each call flushes
+    # exactly one STOP-terminated stream to the shared destination. As with
+    # vanilla pickle, the resulting streams share a memo and must therefore be
+    # consumed by successive load() calls on a single Unpickler.
+    namespaces = []
+    for index in range(2):
+        namespace = _make_test_namespace(f"gbp_reuse_ns_{index}", conn=object())
+        _define_in_namespace(namespace, "def f():\n    return conn\n")
+        namespaces.append(namespace)
+    policy = cloudpickle.StaticGlobalBindingPolicy(
+        [
+            (namespaces[0], "conn", "reuse-token-0"),
+            (namespaces[1], "conn", "reuse-token-1"),
+        ]
+    )
+    destination = io.BytesIO()
+    pickler = cloudpickle.Pickler(
+        destination,
+        protocol=protocol,
+        global_binding_policy=policy,
+    )
+    pickler.dump(namespaces[0]["f"])
+    first_stream_length = len(destination.getvalue())
+    assert first_stream_length > 0
+    pickler.dump(namespaces[1]["f"])
+    full_payload = destination.getvalue()
+    assert len(full_payload) > first_stream_length
+
+    def resolver(token, binding):
+        return f"resolved-{token}"
+
+    unpickler = cloudpickle.Unpickler(
+        io.BytesIO(full_payload), global_binding_resolver=resolver
+    )
+    first_loaded = unpickler.load()
+    second_loaded = unpickler.load()
+    assert first_loaded() == "resolved-reuse-token-0"
+    assert second_loaded() == "resolved-reuse-token-1"
 
 
 if __name__ == "__main__":

@@ -386,6 +386,205 @@ def _find_imported_submodules(code, top_level_dependencies):
     return subimports
 
 
+# EXTERNALIZED GLOBAL BINDINGS
+# ----------------------------
+# The following objects implement the GlobalBindingPolicy protocol, which
+# makes it possible to replace selected *globals* bindings of functions
+# serialized by value with opaque, pure-data resource tokens instead of
+# serializing the bound values themselves. The matching loading-side logic
+# lives in the ``Unpickler`` class below.
+
+
+# Sentinel used to distinguish "no decision recorded yet" from an explicit
+# decision to keep the default by-value serialization (represented by None).
+_UNDECIDED = object()
+
+
+class GlobalBinding(typing.NamedTuple):
+    """Location of an externalized global binding inside a pickled function.
+
+    - ``name`` is the name of the binding in the function's globals namespace;
+    - ``function`` is the qualname of the by-value function that reads the
+      binding (only used for diagnostics);
+    - ``namespace`` is the ``__name__`` attribute of the globals namespace
+      when available, and ``None`` for anonymous dynamic namespaces.
+
+    Instances are pure, immutable data: they are passed to user-provided
+    resolvers and embedded in error messages, never interpreted by
+    cloudpickle itself (no import, network access or file read is ever driven
+    by a token or a binding descriptor).
+    """
+
+    name: str
+    function: str
+    namespace: object
+
+    def __str__(self):
+        namespace = self.namespace if self.namespace is not None else "<dynamic>"
+        return (
+            f"global binding {self.name!r} of function {self.function!r} in "
+            f"namespace {namespace!r}"
+        )
+
+
+# Exact types allowed inside an external binding token. The check is
+# intentionally strict (exact types, no subclasses) so that a token can never
+# carry a callable, a module or any object with arbitrary reconstruction
+# side effects.
+_ALLOWED_TOKEN_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    tuple,
+    list,
+    frozenset,
+    set,
+    dict,
+)
+_TOKEN_CONTAINER_TYPES = (tuple, list, frozenset, set, dict)
+
+
+def _validate_external_token(token, binding):
+    """Recursively validate that ``token`` only contains restricted pure data.
+
+    Raises ``pickle.PicklingError`` otherwise. Pure data means instances of
+    NoneType, bool, int, float, str, bytes and (possibly nested) tuples,
+    lists, sets, frozensets and dicts of such values. Circular references are
+    rejected as well.
+    """
+    seen = set()
+
+    def _walk(value, path):
+        if type(value) not in _ALLOWED_TOKEN_TYPES:
+            raise pickle.PicklingError(
+                f"external token for {binding} contains a disallowed object "
+                f"of type {type(value).__name__} at {path}: tokens must only "
+                "contain pure data (None, bool, int, float, str, bytes and "
+                "nested tuples, lists, sets, frozensets and dicts thereof)"
+            )
+        if isinstance(value, _TOKEN_CONTAINER_TYPES):
+            value_id = id(value)
+            if value_id in seen:
+                raise pickle.PicklingError(
+                    f"external token for {binding} contains a circular "
+                    f"reference at {path}"
+                )
+            seen.add(value_id)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    _walk(key, f"{path}.<dict-key>")
+                    _walk(item, f"{path}[{key!r}]")
+            else:
+                for index, item in enumerate(value):
+                    _walk(item, f"{path}[{index}]")
+
+    _walk(token, "$")
+
+
+class GlobalBindingPolicy:
+    """Select global bindings of by-value functions to externalize as tokens.
+
+    A policy is consulted while pickling a function serialized *by value*
+    only: functions serialized by reference are not concerned since their
+    globals are never serialized in the first place.
+
+    Selection is driven by the identity of the function's globals namespace
+    (``func.__globals__``) and by the binding ``name``; it is never driven by
+    the identity of the bound value. As a consequence, the very same object
+    stored in an unrelated container (for instance a plain dict field, or
+    another globals namespace not covered by the policy) is still serialized
+    by value.
+
+    Users subclass this class and override :meth:`token_for_binding`.
+    """
+
+    def token_for_binding(self, func, name):
+        """Return a pure-data token externalizing ``func.__globals__[name]``.
+
+        Returning ``None`` (the default behavior) keeps cloudpickle's default
+        behavior for that binding: the value read through ``name`` is
+        serialized by value as part of the function's globals.
+
+        The returned token must only contain restricted pure data (see
+        :func:`_validate_external_token`). It is embedded in the pickle
+        stream as-is and handed back to the loading-side resolver without
+        ever being interpreted by cloudpickle: tokens cannot trigger
+        imports, network access or arbitrary file reads.
+        """
+        return None
+
+
+class StaticGlobalBindingPolicy(GlobalBindingPolicy):
+    """Policy driven by an explicit collection of static rules.
+
+    Each rule is a ``(globals_namespace, name, token)`` triplet. A rule only
+    matches functions whose ``__globals__`` dictionary *is* the very same
+    object as ``globals_namespace`` (identity comparison, not equality) and
+    that actually read a global called ``name``. Matching bindings are
+    externalized using ``token`` instead of being serialized by value.
+
+    The policy keeps strong references to the registered namespaces, which
+    also protects against id() reuse across distinct dictionaries.
+    """
+
+    def __init__(self, rules=()):
+        # id(namespace) -> [namespace, {binding_name: token}]
+        self._rules = {}
+        for rule in rules:
+            try:
+                namespace, name, token = rule
+            except (TypeError, ValueError) as e:
+                raise TypeError(
+                    "each global binding rule must be a "
+                    f"(globals_namespace, name, token) triplet, got {rule!r}"
+                ) from e
+            if not isinstance(namespace, dict):
+                raise TypeError(
+                    "the globals namespace of a rule must be a dict, got "
+                    f"{type(namespace).__name__} instead"
+                )
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"the global binding name of a rule must be a str, got " f"{name!r}"
+                )
+            if token is None:
+                raise ValueError(
+                    f"the token for global binding {name!r} cannot be None: "
+                    "remove the rule to keep the default by-value behavior"
+                )
+            binding = GlobalBinding(
+                name=name,
+                function="<policy construction>",
+                namespace=namespace.get("__name__"),
+            )
+            _validate_external_token(token, binding)
+            entry = self._rules.get(id(namespace))
+            if entry is None:
+                self._rules[id(namespace)] = [namespace, {name: token}]
+            elif entry[0] is not namespace:
+                raise RuntimeError(
+                    "two distinct globals namespaces with the same id() were "
+                    "registered in the same StaticGlobalBindingPolicy"
+                )
+            elif name in entry[1] and entry[1][name] != token:
+                raise ValueError(
+                    f"conflicting tokens declared for global binding {name!r} "
+                    f"in the same globals namespace: {entry[1][name]!r} vs "
+                    f"{token!r}"
+                )
+            else:
+                entry[1][name] = token
+
+    def token_for_binding(self, func, name):
+        entry = self._rules.get(id(func.__globals__))
+        if entry is not None and entry[0] is func.__globals__:
+            return entry[1].get(name)
+        return None
+
+
 # relevant opcodes
 STORE_GLOBAL = opcode.opmap["STORE_GLOBAL"]
 _glbl_ops = [STORE_GLOBAL]
@@ -1175,6 +1374,27 @@ def _function_setstate(obj, state):
         setattr(obj, k, v)
 
 
+def _function_setstate_with_external_globals(obj, state):
+    """State setter referenced by streams containing externalized globals.
+
+    When the stream is loaded with ``cloudpickle.Unpickler`` (or
+    ``cloudpickle.loads(..., global_binding_resolver=...)``),
+    ``Unpickler.find_class`` intercepts references to this function and
+    replaces them with a bound method that owns the user-provided resolver.
+    Reaching this module-level function therefore means the stream is being
+    loaded with a plain ``pickle`` unpickler, which has no way to turn the
+    embedded resource tokens into objects: fail explicitly instead of
+    silently importing anything or leaving empty bindings behind.
+    """
+    raise pickle.UnpicklingError(
+        "This cloudpickle stream externalizes some global bindings of "
+        "by-value functions as resource tokens. It must be loaded with "
+        "cloudpickle.loads(..., global_binding_resolver=resolver) (or via "
+        "cloudpickle.Unpickler(..., global_binding_resolver=resolver)) "
+        "instead of a plain pickle.loads call."
+    )
+
+
 def _class_setstate(obj, state):
     state, slotstate = state
     registry = None
@@ -1273,7 +1493,109 @@ class Pickler(pickle.Pickler):
         """Reduce a function that is not pickleable via attribute lookup."""
         newargs = self._function_getnewargs(func)
         state = _function_getstate(func)
-        return (_make_function, newargs, state, None, None, _function_setstate)
+        emits_external_bindings = False
+        if self.global_binding_policy is not None:
+            state, emits_external_bindings = self._apply_global_binding_policy(
+                func, state
+            )
+        state_setter = (
+            _function_setstate_with_external_globals
+            if emits_external_bindings
+            else _function_setstate
+        )
+        return (_make_function, newargs, state, None, None, state_setter)
+
+    def _make_global_binding(self, func, name):
+        return GlobalBinding(
+            name=name,
+            function=getattr(func, "__qualname__", getattr(func, "__name__", "?")),
+            namespace=func.__globals__.get("__name__"),
+        )
+
+    def _apply_global_binding_policy(self, func, state):
+        """Externalize the globals selected by the policy for a by-value func.
+
+        Returns a ``(state, emits_external_bindings)`` tuple where ``state``
+        is a possibly updated copy of the function state and the boolean
+        flags whether this function state carries a new external binding
+        specification for its namespace.
+
+        This method never mutates ``func.__globals__``: externalized values
+        are simply omitted from a freshly built by-value globals dictionary.
+        Decisions (including explicit by-value decisions) are recorded per
+        ``(id(namespace), name)`` so that functions sharing the same globals
+        namespace always externalize a given name with the same token; any
+        inconsistency raises before the buffered payload is flushed.
+        """
+        policy = self.global_binding_policy
+        namespace = func.__globals__
+        namespace_id = id(namespace)
+        state_dict, slotstate = state
+
+        selected = {}
+        # Only names actually read by the code (mirroring the selection done
+        # by _function_getstate) and present in the namespace can be selected.
+        for name in _extract_code_globals(func.__code__):
+            if name not in namespace:
+                continue
+            binding = self._make_global_binding(func, name)
+            try:
+                token = policy.token_for_binding(func, name)
+            except Exception as e:
+                raise pickle.PicklingError(
+                    f"global binding policy raised an error for {binding}"
+                ) from e
+
+            key = (namespace_id, name)
+            previous = self._external_binding_tokens.get(key, _UNDECIDED)
+            if previous is not _UNDECIDED and previous != token:
+                raise pickle.PicklingError(
+                    f"inconsistent global binding policy decision for "
+                    f"{binding}: previous token {previous!r} differs from new "
+                    f"token {token!r}. Functions sharing the same globals "
+                    "namespace must externalize a given global name with a "
+                    "consistent token, or keep it by value consistently."
+                )
+
+            if token is None:
+                # Record the explicit by-value decision so that a later
+                # function of the same namespace cannot switch to
+                # externalization for the same binding.
+                self._external_binding_tokens.setdefault(key, None)
+                continue
+
+            _validate_external_token(token, binding)
+            self._external_binding_tokens[key] = token
+            selected[name] = token
+
+        if not selected:
+            return state, False
+
+        # Build a brand new dict rather than touching func.__globals__: no
+        # key is ever deleted/restored on the user's namespace.
+        f_globals = slotstate["__globals__"]
+        slotstate["__globals__"] = {
+            name: value for name, value in f_globals.items() if name not in selected
+        }
+
+        # Each (namespace, name) binding is embedded exactly once in the whole
+        # stream, so the loading-side resolver is called exactly once for it
+        # (protocol-fixed sharing rule). Other functions of the same
+        # namespace still omit the value from their own by-value globals.
+        new_pairs = [
+            (name, token)
+            for name, token in selected.items()
+            if (namespace_id, name) not in self._external_binding_emitted
+        ]
+        for name in selected:
+            self._external_binding_emitted.add((namespace_id, name))
+
+        if not new_pairs:
+            return (state_dict, slotstate), False
+
+        # Sorting the pairs makes the payload deterministic for a given graph.
+        slotstate["_cloudpickle_external_globals"] = tuple(sorted(new_pairs))
+        return (state_dict, slotstate), True
 
     def _function_reduce(self, obj):
         """Reducer for function objects.
@@ -1324,20 +1646,63 @@ class Pickler(pickle.Pickler):
 
     def dump(self, obj):
         try:
-            return super().dump(obj)
+            result = super().dump(obj)
         except RecursionError as e:
             msg = "Could not pickle object as excessively deep recursion required."
             raise pickle.PicklingError(msg) from e
+        if self._global_binding_buffer is not None:
+            # Pickling completed without any policy error: forward the whole
+            # buffered payload to the actual destination in one write. A
+            # policy error therefore never leaves a partially written stream
+            # behind (conflicts are reported before serialization). Reset the
+            # buffer afterwards so that several dump() calls on the same
+            # Pickler instance each write exactly one stream.
+            self._global_binding_output.write(self._global_binding_buffer.getvalue())
+            self._global_binding_buffer.seek(0)
+            self._global_binding_buffer.truncate(0)
+        return result
 
-    def __init__(self, file, protocol=None, buffer_callback=None):
+    def __init__(
+        self,
+        file,
+        protocol=None,
+        buffer_callback=None,
+        global_binding_policy=None,
+    ):
         if protocol is None:
             protocol = DEFAULT_PROTOCOL
-        super().__init__(file, protocol=protocol, buffer_callback=buffer_callback)
+        if global_binding_policy is not None and not isinstance(
+            global_binding_policy, GlobalBindingPolicy
+        ):
+            raise TypeError(
+                "global_binding_policy must be a GlobalBindingPolicy "
+                f"instance, got {type(global_binding_policy).__name__} instead"
+            )
+        self._global_binding_output = file
+        if global_binding_policy is not None:
+            # Buffer the stream internally so that policy errors (conflicting
+            # tokens, non-pure tokens, exceptions raised by the policy, ...)
+            # are surfaced before any byte reaches the user-provided file.
+            self._global_binding_buffer = io.BytesIO()
+            pickler_file = self._global_binding_buffer
+        else:
+            self._global_binding_buffer = None
+            pickler_file = file
+        super().__init__(
+            pickler_file, protocol=protocol, buffer_callback=buffer_callback
+        )
         # map functions __globals__ attribute ids, to ensure that functions
         # sharing the same global namespace at pickling time also share
         # their global namespace at unpickling time.
         self.globals_ref = {}
         self.proto = int(protocol)
+        self.global_binding_policy = global_binding_policy
+        # (id(namespace), name) -> token decided for this pickler run, where
+        # None records an explicit decision to keep the binding by value.
+        self._external_binding_tokens = {}
+        # (id(namespace), name) pairs whose specification has already been
+        # embedded in a function state, so each binding is emitted once.
+        self._external_binding_emitted = set()
 
     if not PYPY:
         # pickle.Pickler is the C implementation of the CPython pickler and
@@ -1524,7 +1889,85 @@ class Pickler(pickle.Pickler):
 # Shorthands similar to pickle.dump/pickle.dumps
 
 
-def dump(obj, file, protocol=None, buffer_callback=None):
+class Unpickler(pickle.Unpickler):
+    """``pickle.Unpickler`` subclass able to restore externalized globals.
+
+    The optional ``global_binding_resolver`` callable is invoked as
+    ``resolver(token, binding)`` for every externalized binding encountered
+    in the stream, where ``binding`` is a :class:`GlobalBinding` describing
+    where the token was referenced. The returned object is injected into the
+    by-value function's own globals dictionary.
+
+    Sharing rule fixed by the protocol: each distinct ``(globals namespace,
+    binding name)`` pair is resolved exactly once per load, and the resulting
+    object is shared by every function attached to that namespace. Equal
+    tokens used in distinct namespaces are resolved independently.
+
+    All the resolver state lives on the ``Unpickler`` instance. A resolver
+    that itself calls :func:`loads` (reentrant loading) therefore gets a
+    fresh, properly isolated context: no process-global temporary map is
+    involved.
+    """
+
+    def __init__(self, file, *, global_binding_resolver=None, **kwargs):
+        super().__init__(file, **kwargs)
+        if global_binding_resolver is not None and not callable(
+            global_binding_resolver
+        ):
+            raise TypeError(
+                "global_binding_resolver must be a callable, got "
+                f"{type(global_binding_resolver).__name__} instead"
+            )
+        self._global_binding_resolver = global_binding_resolver
+
+    def find_class(self, module, name):
+        # Intercept the state setter associated with externalized bindings
+        # and substitute a bound method holding this unpickler's resolver.
+        # No other global resolution is altered.
+        if (
+            module == __name__
+            and name == _function_setstate_with_external_globals.__name__
+        ):
+            if self._global_binding_resolver is None:
+                raise pickle.UnpicklingError(
+                    "this cloudpickle stream externalizes global bindings "
+                    "and requires a global_binding_resolver callable to be "
+                    "loaded"
+                )
+            return self._function_setstate_with_external_globals
+        return super().find_class(module, name)
+
+    def _function_setstate_with_external_globals(self, obj, state):
+        state_dict, slotstate = state
+        bindings = slotstate.pop("_cloudpickle_external_globals")
+
+        # Restore the regular state (filtered by-value globals, closure,
+        # dynamic attributes and slots) through the standard routine first.
+        _function_setstate(obj, (state_dict, slotstate))
+
+        # Then turn each embedded token into an object and inject it only
+        # into this load's own by-value globals dict. Real imported module
+        # __dict__ objects are never modified here.
+        namespace = obj.__globals__
+        namespace_label = namespace.get("__name__")
+        for name, token in bindings:
+            binding = GlobalBinding(
+                name=name,
+                function=obj.__qualname__,
+                namespace=namespace_label,
+            )
+            try:
+                value = self._global_binding_resolver(token, binding)
+            except Exception as e:
+                raise pickle.UnpicklingError(
+                    f"global binding resolver failed for {binding} while "
+                    f"resolving token {token!r}: {e!r}"
+                ) from e
+            namespace[name] = value
+        return obj
+
+
+def dump(obj, file, protocol=None, buffer_callback=None, global_binding_policy=None):
     """Serialize obj as bytes streamed into file
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1536,11 +1979,25 @@ def dump(obj, file, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    ``global_binding_policy`` optionally externalizes selected globals of
+    by-value functions as pure-data resource tokens; see
+    :class:`GlobalBindingPolicy`.
     """
-    Pickler(file, protocol=protocol, buffer_callback=buffer_callback).dump(obj)
+    Pickler(
+        file,
+        protocol=protocol,
+        buffer_callback=buffer_callback,
+        global_binding_policy=global_binding_policy,
+    ).dump(obj)
 
 
-def dumps(obj, protocol=None, buffer_callback=None):
+def dumps(
+    obj,
+    protocol=None,
+    buffer_callback=None,
+    global_binding_policy=None,
+):
     """Serialize obj as a string of bytes allocated in memory
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1552,15 +2009,57 @@ def dumps(obj, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    ``global_binding_policy`` optionally externalizes selected globals of
+    by-value functions as pure-data resource tokens; see
+    :class:`GlobalBindingPolicy`.
     """
     with io.BytesIO() as file:
-        cp = Pickler(file, protocol=protocol, buffer_callback=buffer_callback)
+        cp = Pickler(
+            file,
+            protocol=protocol,
+            buffer_callback=buffer_callback,
+            global_binding_policy=global_binding_policy,
+        )
         cp.dump(obj)
         return file.getvalue()
 
 
-# Include pickles unloading functions in this namespace for convenience.
-load, loads = pickle.load, pickle.loads
+def load(file, *, global_binding_resolver=None, **kwargs):
+    """Deserialize one object from a binary file.
+
+    When ``global_binding_resolver`` is provided, the stream is read with a
+    cloudpickle :class:`Unpickler` and the callable is invoked as
+    ``resolver(token, binding)`` to reconstruct every externalized global
+    binding. Without it, this function is a thin wrapper around
+    ``pickle.load`` so that streams produced without a policy behave exactly
+    as before.
+    """
+    if global_binding_resolver is None:
+        return pickle.load(file, **kwargs)
+    return Unpickler(
+        file, global_binding_resolver=global_binding_resolver, **kwargs
+    ).load()
+
+
+def loads(data, *, global_binding_resolver=None, **kwargs):
+    """Deserialize one object from a bytes-like object.
+
+    When ``global_binding_resolver`` is provided, the bytes are read with a
+    cloudpickle :class:`Unpickler` and the callable is invoked as
+    ``resolver(token, binding)`` to reconstruct every externalized global
+    binding. Without it, this function is a thin wrapper around
+    ``pickle.loads`` so that streams produced without a policy behave exactly
+    as before.
+    """
+    if global_binding_resolver is None:
+        return pickle.loads(data, **kwargs)
+    return Unpickler(
+        io.BytesIO(data),
+        global_binding_resolver=global_binding_resolver,
+        **kwargs,
+    ).load()
+
 
 # Backward compat alias.
 CloudPickler = Pickler

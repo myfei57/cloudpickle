@@ -120,6 +120,62 @@ situations:
 - If a function pickled by reference uses a function pickled by value during its execution.
 
 
+Externalizing global bindings with resource tokens
+---------------------------------------------------
+
+Some globals read by by-value functions cannot (or should not) be serialized
+by value: live database connections, sockets, client handles, ... A
+`GlobalBindingPolicy` makes it possible to replace such a binding in the
+pickle stream with an opaque, restricted **pure-data token** (only `None`,
+`bool`, `int`, `float`, `str`, `bytes` and nested `tuple`/`list`/`set`/
+`frozenset`/`dict` of those are allowed). The bound value itself never enters
+the payload.
+
+Selection is based on the identity of the function's globals namespace
+(`func.__globals__`) and on the binding name, never on the identity of the
+bound value, so the same object stored in an unrelated container (or in
+another globals namespace) is still serialized by value:
+
+```python
+>>> import cloudpickle
+
+>>> namespace = {"db_connection": live_connection}  # live_connection is unpicklable
+>>> exec("def query():\n    return db_connection", namespace)
+>>> policy = cloudpickle.StaticGlobalBindingPolicy(
+...     [(namespace, "db_connection", "resource-id-1234")]
+... )
+>>> payload = cloudpickle.dumps(namespace["query"], global_binding_policy=policy)
+```
+
+On the loading side, an explicit resolver callable turns each token back into
+an object. It is called as `resolver(token, binding)`, where `binding` is a
+`GlobalBinding` describing the location of the binding; resolver errors are
+reported with that binding path. Tokens are never interpreted by cloudpickle
+itself (no implicit import, network access or file read):
+
+```python
+>>> def resolver(token, binding):
+...     assert binding.name == "db_connection"
+...     return reconnect_using_resource_id(token)
+
+>>> loaded_query = cloudpickle.loads(
+...     payload, global_binding_resolver=resolver
+... )
+```
+
+The sharing rule is fixed by the protocol: each `(globals namespace, binding
+name)` pair is resolved exactly once per load, and every function sharing that
+namespace receives the same resolved object. Functions sharing a namespace
+must externalize a given name with a consistent token; inconsistent decisions
+raise a `pickle.PicklingError` before any byte is written. The original
+`func.__globals__` is never modified, functions pickled by reference are not
+affected by the policy, and loading only writes into the freshly reconstructed
+by-value globals dict — real imported module `__dict__` objects are never
+polluted. Streams containing externalized bindings cannot be loaded with a
+plain `pickle.loads`: an explicit error message points to
+`cloudpickle.loads(..., global_binding_resolver=...)`.
+
+
 Running the tests
 -----------------
 
